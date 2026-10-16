@@ -1,13 +1,16 @@
-{ flake, buildFHSEnv, buildDotnetModule, dotnetCorePackages, git, python3, zstd, zlib }:
+{ flake, lib, buildFHSEnv, buildDotnetModule, dotnetCorePackages, git, python3, zstd, zlib, tzdata }:
 let
   rev = flake.rev or "dirty";
   dotnet-sdk = with dotnetCorePackages;
-    combinePackages [ sdk_8_0 aspnetcore_8_0 sdk_9_0 aspnetcore_9_0 ];
+    combinePackages [ sdk_10_0 ];
   watchdog = buildDotnetModule {
     inherit dotnet-sdk;
     name = "space-station-14-watchdog-${rev}";
 
-    src = ../.;
+    src = lib.cleanSourceWith {
+      src = ../.;
+      filter = path: type: !(builtins.elem (baseNameOf path) [ "bin" "obj" ".git" "dist" ]);
+    };
 
     projectFile = [ "SS14.Watchdog/SS14.Watchdog.csproj" ];
 
@@ -17,10 +20,10 @@ let
     # Generated using "fetch-deps" flake app output.
     nugetDeps = ./deps.json;
 
-    runtimeDeps = [ git python3 zstd zlib ];
+    runtimeDeps = [ git python3 zstd zlib tzdata ];
 
     dotnet-runtime = with dotnetCorePackages;
-      combinePackages [ runtime_8_0 aspnetcore_8_0 runtime_9_0 aspnetcore_9_0 ];
+      combinePackages [ runtime_10_0 aspnetcore_10_0 ];
 
     executables = [ "SS14.Watchdog" ];
   };
@@ -28,7 +31,7 @@ in
 buildFHSEnv {
   name = "SS14.Watchdog";
 
-  targetPkgs = pkgs: [ watchdog git python3 dotnet-sdk zstd ];
+  targetPkgs = pkgs: [ watchdog git python3 dotnet-sdk zstd tzdata ];
 
   runScript = "SS14.Watchdog";
 

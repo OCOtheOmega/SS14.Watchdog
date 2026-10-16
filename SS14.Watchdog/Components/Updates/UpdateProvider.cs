@@ -3,12 +3,10 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Collections.Generic;
-using System.IO.Compression;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using JetBrains.Annotations;
-using Mono.Unix;
 
 namespace SS14.Watchdog.Components.Updates
 {
@@ -29,13 +27,13 @@ namespace SS14.Watchdog.Components.Updates
         public abstract Task<bool> CheckForUpdateAsync(string? currentVersion, CancellationToken cancel = default);
 
         /// <summary>
-        ///     Run an update if one is available.
+        ///     Download, validate and stage an update without touching the live server files.
         /// </summary>
         /// <param name="currentVersion">The current version the server is on.</param>
-        /// <param name="binPath">The bin path of the server instance, to update into.</param>
+        /// <param name="options">Paths and size limits for the staged update.</param>
         /// <param name="cancel">Cancellation token.</param>
-        /// <returns>The version updated to if an update happened successfully, null other.</returns>
-        public abstract Task<string?> RunUpdateAsync(string? currentVersion, string binPath,
+        /// <returns>A validated staged update, or null when no update can be prepared.</returns>
+        public abstract Task<PreparedUpdate?> PrepareUpdateAsync(string? currentVersion, UpdatePreparationOptions options,
             CancellationToken cancel = default);
 
         public virtual IEnumerable<KeyValuePair<string, string>> GetLaunchCVarOverrides(string currentVersion)
@@ -103,25 +101,11 @@ namespace SS14.Watchdog.Components.Updates
             return Convert.ToHexString(sha.ComputeHash(file));
         }
 
-        protected static void DoBuildExtract(Stream stream, string binPath)
-        {
-            using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
-            archive.ExtractToDirectory(binPath);
-
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
-                RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-            {
-                // chmod +x Robust.Server
-
-                var rsPath = Path.Combine(binPath, "Robust.Server");
-                if (File.Exists(rsPath))
-                {
-                    var f = new UnixFileInfo(rsPath);
-                    f.FileAccessPermissions |=
-                        FileAccessPermissions.UserExecute | FileAccessPermissions.GroupExecute |
-                        FileAccessPermissions.OtherExecute;
-                }
-            }
-        }
     }
+
+    public sealed record UpdatePreparationOptions(
+        string InstanceDirectory,
+        long MaximumDownloadBytes,
+        long MaximumExtractedBytes,
+        long MinimumFreeSpaceBytes = 1024L * 1024L * 1024L);
 }

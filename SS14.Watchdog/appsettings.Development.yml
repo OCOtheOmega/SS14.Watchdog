@@ -58,4 +58,10 @@ Servers:
       UpdateType: "Manifest"
       Updates:
         ManifestUrl: "https://wizards.cdn.spacestation14.com/fork/wizards/manifest"
+      # Download and validate a new build before asking the game server to restart.
+      AutoUpdateChecks: true
+      AutoUpdateCheckIntervalSeconds: 300
+      StartupTimeoutSeconds: 180
+      AutoUpdateMaximumDownloadMiB: 4096
+      AutoUpdateMaximumExtractedMiB: 8192
       TimeoutSeconds: 90

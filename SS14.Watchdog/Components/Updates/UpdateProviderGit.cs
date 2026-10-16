@@ -2,15 +2,12 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
-using System.Linq;
-using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Mono.Unix;
 using SS14.Watchdog.Components.ServerManagement;
 using SS14.Watchdog.Configuration.Updates;
 
@@ -203,7 +200,10 @@ namespace SS14.Watchdog.Components.Updates
             return update;
         }
 
-        public override async Task<string?> RunUpdateAsync(string? currentVersion, string binPath, CancellationToken cancel = default)
+        public override async Task<PreparedUpdate?> PrepareUpdateAsync(
+            string? currentVersion,
+            UpdatePreparationOptions options,
+            CancellationToken cancel = default)
         {
             try
             {
@@ -232,7 +232,7 @@ namespace SS14.Watchdog.Components.Updates
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning($"Failed git submodule update: {ex}");
+                        _logger.LogWarning(Utility.SensitiveData.SafeException(ex), "Failed git submodule update.");
                         _logger.LogWarning($"Nuking the repository from orbit to recover!");
                         await TryClone(cancel);
                     }
@@ -328,52 +328,27 @@ namespace SS14.Watchdog.Components.Updates
                     }
                 }
 
-                _logger.LogTrace("Applying server update.");
-
-                if (Directory.Exists(binPath))
-                {
-                    Directory.Delete(binPath, true);
-                }
-
-                Directory.CreateDirectory(binPath);
-
-                _logger.LogTrace("Extracting zip file");
-
-                // Actually extract.
+                _logger.LogTrace("Staging built server package.");
                 await using (var stream = File.Open(serverPackage, FileMode.Open))
                 {
-                    using (var archive = new ZipArchive(stream, ZipArchiveMode.Read))
-                    {
-                        archive.ExtractToDirectory(binPath);
-                    }
+                    var prepared = await UpdateStaging.StageArchiveAsync(
+                        stream,
+                        actualConfirmedHead,
+                        options.InstanceDirectory,
+                        options.MaximumExtractedBytes,
+                        cancel,
+                        options.MinimumFreeSpaceBytes);
+
+                    File.Delete(serverPackage);
+                    _logger.LogInformation("Prepared validated Git update {Version} in {StagingDirectory}.",
+                        actualConfirmedHead, prepared.StagingDirectory);
+                    return prepared;
                 }
-
-                // Remove the package now that it's extracted.
-                File.Delete(serverPackage);
-
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ||
-                    RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                {
-                    // chmod +x Robust.Server
-
-                    var rsPath = Path.Combine(binPath, "Robust.Server");
-                    if (File.Exists(rsPath))
-                    {
-                        var f = new UnixFileInfo(rsPath);
-                        f.FileAccessPermissions |=
-                            FileAccessPermissions.UserExecute | FileAccessPermissions.GroupExecute |
-                            FileAccessPermissions.OtherExecute;
-                    }
-                }
-
-                // ReSharper disable once RedundantTypeArgumentsOfMethod
-                return actualConfirmedHead;
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Failed to run update!");
-
-                return null;
+                _logger.LogError(Utility.SensitiveData.SafeException(e), "Failed to prepare Git update.");
+                throw;
             }
         }
 

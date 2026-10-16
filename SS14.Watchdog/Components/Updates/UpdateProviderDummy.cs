@@ -14,7 +14,10 @@ namespace SS14.Watchdog.Components.Updates
             return Task.FromResult(true);
         }
 
-        public override Task<string?> RunUpdateAsync(string? currentVersion, string binPath, CancellationToken cancel = default)
+        public override Task<PreparedUpdate?> PrepareUpdateAsync(
+            string? currentVersion,
+            UpdatePreparationOptions options,
+            CancellationToken cancel = default)
         {
             string newNumber;
             if (currentVersion == null)
@@ -28,7 +31,7 @@ namespace SS14.Watchdog.Components.Updates
                 newNumber = $"{p + 1}";
             }
 
-            return Task.FromResult<string?>(newNumber);
+            return Task.FromResult<PreparedUpdate?>(new PreparedUpdate(newNumber, null));
         }
     }
 }

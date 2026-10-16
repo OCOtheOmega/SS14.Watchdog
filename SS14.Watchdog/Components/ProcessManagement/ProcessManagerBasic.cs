@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Threading;
@@ -51,13 +51,12 @@ public sealed class ProcessManagerBasic : IProcessManager
 
         foreach (var argument in data.Arguments)
         {
-            _logger.LogTrace("Arg: {Argument}", argument);
             startInfo.ArgumentList.Add(argument);
         }
 
         foreach (var (var, value) in data.EnvironmentVariables)
         {
-            _logger.LogTrace("Env: {EnvVar} = {EnvValue}", var, value);
+            _logger.LogTrace("Setting environment variable {EnvVar}.", var);
             startInfo.EnvironmentVariables[var] = value;
         }
 
@@ -72,7 +71,7 @@ public sealed class ProcessManagerBasic : IProcessManager
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Process launch failed!");
+            _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Process launch failed!");
             throw;
         }
 

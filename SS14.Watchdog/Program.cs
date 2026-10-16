@@ -24,6 +24,9 @@ namespace SS14.Watchdog
                     builder.AddYamlFile("appsettings.yml", false);
                     builder.AddYamlFile($"appsettings.{env.EnvironmentName}.yml", true);
                     builder.AddYamlFile("appsettings.Secret.yml", true);
+                    // Keep environment and command-line overrides above YAML, including Docker secrets/settings.
+                    builder.AddEnvironmentVariables();
+                    builder.AddCommandLine(args);
                 })
                 .UseSerilog((ctx, cfg) =>
                 {

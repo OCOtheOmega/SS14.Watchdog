@@ -1,0 +1,15 @@
+**/bin
+**/obj
+.git
+.github
+.vs
+.idea
+**/appsettings.Secret.yml
+**/*.db
+**/*.db-*
+**/instances
+**/dumps
+.env
+.env.*
+!.env.example
+dist

@@ -85,7 +85,7 @@ namespace SS14.Watchdog.Components.ServerManagement
         /// </summary>
         /// <returns>
         /// The resolved version that was queued to revert to, or null if this instance does not support
-        /// reverting, the requested version does not exist, or no earlier version is available.
+        /// reverting, no matching version is available, or the target build could not be prepared.
         /// </returns>
         Task<string?> DoRevertCommandAsync(string? targetVersion, bool immediate, CancellationToken cancel = default);
 

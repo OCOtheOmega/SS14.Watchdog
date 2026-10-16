@@ -21,9 +21,10 @@ namespace SS14.Watchdog.Components.Updates
 
     public sealed class UpdateProviderManifest : UpdateProvider
     {
+        public const string HttpClientName = "manifest_updates";
         private const int DownloadTimeoutSeconds = 120;
 
-        private readonly HttpClient _httpClient = new();
+        private readonly HttpClient _httpClient;
 
         private readonly string _manifestUrl;
         private readonly UpdateProviderManifestConfiguration _configuration;
@@ -31,11 +32,14 @@ namespace SS14.Watchdog.Components.Updates
 
         public UpdateProviderManifest(
             UpdateProviderManifestConfiguration configuration,
-            ILogger<UpdateProviderManifest> logger)
+            ILogger<UpdateProviderManifest> logger,
+            HttpClient? httpClient = null)
         {
+            _httpClient = httpClient ?? new HttpClient();
             _configuration = configuration;
             _logger = logger;
             _manifestUrl = configuration.ManifestUrl;
+            SensitiveData.Register(configuration.Authentication?.Password);
         }
 
         public override async Task<bool> CheckForUpdateAsync(
@@ -49,62 +53,23 @@ namespace SS14.Watchdog.Components.Updates
             return SelectMaxVersion(manifest) != currentVersion;
         }
 
-        public override async Task<string?> RunUpdateAsync(
+        public override async Task<PreparedUpdate?> PrepareUpdateAsync(
             string? currentVersion,
-            string binPath,
+            UpdatePreparationOptions options,
             CancellationToken cancel = default)
         {
-            var manifest = await FetchManifestInfoAsync(cancel);
-            if (manifest == null)
-                return null;
-
-            var maxVersion = SelectMaxVersion(manifest);
-            if (maxVersion == null)
-            {
-                _logger.LogWarning("There are no versions, not updating");
-                return null;
-            }
-
-            if (maxVersion == currentVersion)
-            {
-                _logger.LogDebug("Update not necessary!");
-                return null;
-            }
-
-            _logger.LogTrace("New version is {NewVersion} from {OldVersion}", maxVersion, currentVersion ?? "<none>");
-
-            return await DownloadAndInstallAsync(maxVersion, manifest.Builds[maxVersion], binPath, cancel);
+            return await PrepareVersionAsync(currentVersion, null, options, cancel);
         }
 
         /// <summary>
-        /// Executes an update to the specified target version from the manifest.
+        /// Stages an explicitly selected manifest version using the same validation as automatic updates.
         /// </summary>
-        /// <param name="targetVersion">
-        /// The target version to update to. This must correspond to a valid version in the manifest.
-        /// </param>
-        /// <param name="binPath">
-        /// The path to the binary directory where the update files will be applied.
-        /// </param>
-        /// <param name="cancel">
-        /// An optional <see cref="CancellationToken"/> that can be used to signal the operation should be canceled.
-        /// </param>
-        /// <returns>
-        /// A string representing the updated revision if the update is successful; otherwise, null
-        /// if the update fails or the target version is not found in the manifest.
-        /// </returns>
-        public async Task<string?> RunUpdateToVersionAsync(
+        public Task<PreparedUpdate?> PrepareUpdateToVersionAsync(
             string targetVersion,
-            string binPath,
+            UpdatePreparationOptions options,
             CancellationToken cancel = default)
         {
-            var manifest = await FetchManifestInfoAsync(cancel);
-            if (manifest == null || !manifest.Builds.TryGetValue(targetVersion, out var versionInfo))
-            {
-                _logger.LogError("Requested revert target version {Version} not found in manifest", targetVersion);
-                return null;
-            }
-
-            return await DownloadAndInstallAsync(targetVersion, versionInfo, binPath, cancel);
+            return PrepareVersionAsync(null, targetVersion, options, cancel);
         }
 
         /// <summary>
@@ -143,6 +108,7 @@ namespace SS14.Watchdog.Components.Updates
             return manifest.Builds
                 .Where(kv => kv.Value.Time < currentInfo.Time)
                 .OrderByDescending(kv => kv.Value.Time)
+                .ThenByDescending(kv => kv.Key, StringComparer.Ordinal)
                 .Select(kv => kv.Key)
                 .FirstOrDefault();
         }
@@ -154,7 +120,7 @@ namespace SS14.Watchdog.Components.Updates
         /// The maximum number of recent versions to retrieve.
         /// </param>
         /// <param name="cancel">
-        /// An optional <see cref="CancellationToken"/> that can be used to signal the operation should be canceled.
+        /// An optional <see cref="CancellationToken"/> used to signal the operation should be canceled.
         /// </param>
         /// <returns>
         /// A read-only list of <see cref="UpdateVersionInfo"/> representing the most recent versions sorted by date,
@@ -170,123 +136,144 @@ namespace SS14.Watchdog.Components.Updates
 
             return manifest.Builds
                 .OrderByDescending(kv => kv.Value.Time)
+                .ThenByDescending(kv => kv.Key, StringComparer.Ordinal)
                 .Take(count)
                 .Select(kv => new UpdateVersionInfo(kv.Key, kv.Value.Time))
                 .ToList();
         }
 
-        /// <summary>
-        /// Downloads the specified version of the server binary, verifies its integrity, and installs it to the target directory.
-        /// </summary>
-        /// <param name="version">
-        /// The version of the server to download and install.
-        /// </param>
-        /// <param name="versionInfo">
-        /// Metadata containing details about the server build for the specified version.
-        /// </param>
-        /// <param name="binPath">
-        /// The path to the binary directory where the downloaded and extracted files will be installed.
-        /// </param>
-        /// <param name="cancel">
-        /// An optional <see cref="CancellationToken"/> that can be used to signal the operation should be canceled.
-        /// </param>
-        /// <returns>
-        /// A string representing the installed version if the operation is successful; otherwise, null if the download or installation fails.
-        /// </returns>
-        private async Task<string?> DownloadAndInstallAsync(
-            string version,
-            VersionInfo versionInfo,
-            string binPath,
+        private async Task<PreparedUpdate?> PrepareVersionAsync(
+            string? currentVersion,
+            string? targetVersion,
+            UpdatePreparationOptions options,
             CancellationToken cancel)
         {
-            var rid = RidUtility.FindBestRid(versionInfo.Server.Keys);
-
-            if (rid == null)
-            {
-                _logger.LogError("Unable to find compatible build for our platform!");
-                return null;
-            }
-
-            var build = versionInfo.Server[rid];
-            var downloadUrl = build.Url;
-            var downloadHash = Convert.FromHexString(build.Sha256);
-
-            // Create temporary file to download binary into (not doing this in memory).
-            await using var tempFile = TempFile.CreateTempFile();
-
-            _logger.LogTrace("Downloading server binary from {Download} to {TempFile}", downloadUrl, tempFile.Name);
-
-            var timeoutTcs = CancellationTokenSource.CreateLinkedTokenSource(cancel);
-            timeoutTcs.CancelAfter(TimeSpan.FromSeconds(DownloadTimeoutSeconds));
-
             try
             {
+                var manifest = await FetchManifestInfoAsync(cancel);
+                if (manifest == null)
+                    return null;
+
+                var maxVersion = targetVersion ?? SelectMaxVersion(manifest);
+                if (maxVersion == null)
+                {
+                    _logger.LogWarning("Manifest contains no builds; not updating.");
+                    return null;
+                }
+
+                if (maxVersion == currentVersion)
+                {
+                    _logger.LogDebug("Update not necessary!");
+                    return null;
+                }
+
+                if (!manifest.Builds.TryGetValue(maxVersion, out var versionInfo))
+                {
+                    _logger.LogWarning("Requested version {Version} is no longer present in the manifest.", maxVersion);
+                    return null;
+                }
+
+                _logger.LogTrace("Preparing version {NewVersion} from {OldVersion}", maxVersion, currentVersion ?? "<none>");
+
+                var rid = RidUtility.FindBestRid(versionInfo.Server.Keys);
+                if (rid == null)
+                {
+                    throw new InvalidDataException($"Manifest version {maxVersion} has no compatible server build for this platform.");
+                }
+
+                var build = versionInfo.Server[rid];
+                if (!Uri.TryCreate(build.Url, UriKind.Absolute, out var downloadUri) || downloadUri.Scheme != Uri.UriSchemeHttps)
+                {
+                    throw new InvalidDataException($"Manifest version {maxVersion} has a non-HTTPS or invalid server URL.");
+                }
+
+                byte[] downloadHash;
+                try
+                {
+                    downloadHash = Convert.FromHexString(build.Sha256);
+                }
+                catch (FormatException)
+                {
+                    throw new InvalidDataException($"Manifest version {maxVersion} has an invalid SHA-256 value.");
+                }
+
+                if (downloadHash.Length != 32)
+                {
+                    throw new InvalidDataException($"Manifest version {maxVersion} has an invalid SHA-256 length.");
+                }
+
+                await using var tempFile = TempFile.CreateTempFile(options.InstanceDirectory);
+                _logger.LogTrace("Downloading server binary to {TempFile}.", tempFile.Name);
+
+                using var timeoutTcs = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+                timeoutTcs.CancelAfter(TimeSpan.FromSeconds(DownloadTimeoutSeconds));
                 using var resp = await _httpClient.SendAsync(
-                    MakeAuthenticatedGet(downloadUrl),
+                    MakeAuthenticatedGet(downloadUri.ToString()),
                     HttpCompletionOption.ResponseHeadersRead,
                     timeoutTcs.Token);
 
-                _logger.LogTrace("Received HTTP response, starting download");
-
                 resp.EnsureSuccessStatusCode();
+                await UpdateStaging.CopyHttpContentWithLimitAsync(
+                    resp.Content,
+                    tempFile,
+                    options.MaximumDownloadBytes,
+                    timeoutTcs.Token,
+                    options.MinimumFreeSpaceBytes);
 
-                await resp.Content.CopyToAsync(tempFile, timeoutTcs.Token);
+                _logger.LogTrace("Update file downloaded to disk; verifying SHA-256.");
+                tempFile.Seek(0, SeekOrigin.Begin);
+                var hashOutput = await SHA256.HashDataAsync(tempFile, cancel);
 
-                _logger.LogTrace("Update file downloaded to disk");
+                if (!downloadHash.AsSpan().SequenceEqual(hashOutput))
+                {
+                    throw new InvalidDataException($"SHA-256 verification failed for manifest version {maxVersion}.");
+                }
+
+                tempFile.Seek(0, SeekOrigin.Begin);
+                var prepared = await UpdateStaging.StageArchiveAsync(
+                    tempFile,
+                    maxVersion,
+                    options.InstanceDirectory,
+                    options.MaximumExtractedBytes,
+                    cancel,
+                    options.MinimumFreeSpaceBytes);
+                _logger.LogInformation("Prepared validated update {Version} in {StagingDirectory}.", maxVersion, prepared.StagingDirectory);
+                return prepared;
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (!cancel.IsCancellationRequested)
             {
-                _logger.LogError("Timeout while downloading: {Timeout} seconds", DownloadTimeoutSeconds);
+                throw new IOException($"Timed out while preparing an update after {DownloadTimeoutSeconds} seconds.");
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(SensitiveData.SafeException(e), "Failed to prepare update from manifest.");
                 throw;
             }
-
-            // Download to file...
-
-            // Verify hash because why not?
-            _logger.LogTrace("Verifying hash of download file...");
-            tempFile.Seek(0, SeekOrigin.Begin);
-            var hashOutput = await SHA256.HashDataAsync(tempFile, cancel);
-
-            if (!downloadHash.AsSpan().SequenceEqual(hashOutput))
-            {
-                _logger.LogError("Hash verification failed while updating!");
-                return null;
-            }
-
-            _logger.LogTrace("Deleting old bin directory ({BinPath})", binPath);
-            if (Directory.Exists(binPath))
-            {
-                Directory.Delete(binPath, true);
-            }
-
-            Directory.CreateDirectory(binPath);
-
-            _logger.LogTrace("Extracting zip file");
-
-            tempFile.Seek(0, SeekOrigin.Begin);
-            DoBuildExtract(tempFile, binPath);
-
-            return version;
         }
 
         private async Task<ManifestInfo?> FetchManifestInfoAsync(CancellationToken cancel)
         {
-            _logger.LogDebug("Fetching build manifest from {ManifestUrl}...", _manifestUrl);
+            if (!Uri.TryCreate(_manifestUrl, UriKind.Absolute, out var manifestUri) || manifestUri.Scheme != Uri.UriSchemeHttps)
+            {
+                throw new InvalidDataException("Manifest URL must be an absolute HTTPS URL.");
+            }
+
+            _logger.LogDebug("Fetching build manifest.");
             try
             {
-                using var resp = await _httpClient.SendAsync(MakeAuthenticatedGet(_manifestUrl), cancel);
+                using var resp = await _httpClient.SendAsync(MakeAuthenticatedGet(manifestUri.ToString()), cancel);
                 resp.EnsureSuccessStatusCode();
 
                 var manifest = await resp.Content.ReadFromJsonAsync<ManifestInfo>(cancel);
                 if (manifest == null)
-                    _logger.LogError("Failed to fetch build manifest: JSON response was null!");
+                    throw new InvalidDataException("Build manifest response was null.");
 
                 return manifest;
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Failed to fetch build manifest!");
-                return null;
+                _logger.LogError(SensitiveData.SafeException(e), "Failed to fetch build manifest.");
+                throw;
             }
         }
 
@@ -309,7 +296,11 @@ namespace SS14.Watchdog.Components.Updates
             if (manifest.Builds.Count == 0)
                 return null;
 
-            return manifest.Builds.Aggregate((a, b) => a.Value.Time > b.Value.Time ? a : b).Key;
+            return manifest.Builds
+                .OrderByDescending(x => x.Value.Time)
+                .ThenByDescending(x => x.Key, StringComparer.Ordinal)
+                .Select(x => x.Key)
+                .First();
         }
 
         private sealed record ManifestInfo

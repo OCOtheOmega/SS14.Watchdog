@@ -38,16 +38,16 @@ namespace SS14.Watchdog.Components.Updates
             return Task.FromResult(currentVersion != _specificConfiguration.CurrentVersion);
         }
 
-        public override Task<string?> RunUpdateAsync(string? currentVersion, string binPath,
+        public override Task<PreparedUpdate?> PrepareUpdateAsync(string? currentVersion, UpdatePreparationOptions options,
             CancellationToken cancel = default)
         {
             if (currentVersion == _specificConfiguration.CurrentVersion)
             {
-                return Task.FromResult<string?>(null);
+                return Task.FromResult<PreparedUpdate?>(null);
             }
 
-            // ReSharper disable once RedundantTypeArgumentsOfMethod
-            return Task.FromResult<string?>(_specificConfiguration.CurrentVersion);
+            return Task.FromResult<PreparedUpdate?>(
+                new PreparedUpdate(_specificConfiguration.CurrentVersion, null));
         }
 
         public override IEnumerable<KeyValuePair<string, string>> GetLaunchCVarOverrides(string currentVersion)

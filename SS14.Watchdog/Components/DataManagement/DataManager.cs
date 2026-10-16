@@ -43,7 +43,7 @@ public sealed class DataManager : IHostedService
 
     Task IHostedService.StartAsync(CancellationToken cancellationToken)
     {
-        var con = OpenConnection();
+        using var con = OpenConnection();
 
         VerifyDBIntegrity(con);
 

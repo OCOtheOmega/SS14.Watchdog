@@ -1,0 +1,13 @@
+[net]
+port = 1212
+bindto = "0.0.0.0"
+
+[status]
+enabled = true
+bind = "0.0.0.0:1212"
+
+[game]
+hostname = "My SS14 server"
+
+[hub]
+advertise = false

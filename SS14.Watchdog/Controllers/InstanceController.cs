@@ -96,7 +96,7 @@ namespace SS14.Watchdog.Controllers
             if (resolved == null)
             {
                 return BadRequest(
-                    "This instance does not support reverting, the specified version does not exist, or no earlier version is available.");
+                    "This instance does not support reverting, no matching version is available, or the target build could not be downloaded and validated.");
             }
 
             return Ok(new { version = resolved, immediate });

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -55,7 +55,7 @@ public static class Migrator
             }
             catch (Exception e)
             {
-                logger.LogError(e, "Exception during migration {Transaction}, rolling back...!", name);
+                logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Exception during migration {Transaction}, rolling back...!", name);
                 transaction.Rollback(name);
                 success = false;
                 break;

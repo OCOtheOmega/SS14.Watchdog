@@ -40,7 +40,7 @@ namespace SS14.Watchdog.Components.BackgroundTasks
                 }
                 catch (Exception e)
                 {
-                    _logger.LogError(e, "Exception inside background task.");
+                    _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Exception inside background task.");
                 }
             }
         }

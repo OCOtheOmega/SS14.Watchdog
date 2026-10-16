@@ -14,6 +14,7 @@
 
     <ItemGroup>
       <ProjectReference Include="..\SS14.Watchdog\SS14.Watchdog.csproj" />
+      <Compile Include="../integrations/ss14/WatchdogUpdateProtocol.cs" Link="Integration/WatchdogUpdateProtocol.cs" />
     </ItemGroup>
 
 </Project>

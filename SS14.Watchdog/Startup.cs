@@ -14,6 +14,7 @@ using SS14.Watchdog.Components.DataManagement;
 using SS14.Watchdog.Components.Notifications;
 using SS14.Watchdog.Components.ProcessManagement;
 using SS14.Watchdog.Components.ServerManagement;
+using SS14.Watchdog.Components.Updates;
 using SS14.Watchdog.Configuration;
 
 namespace SS14.Watchdog
@@ -32,7 +33,9 @@ namespace SS14.Watchdog
         public void ConfigureServices(IServiceCollection services)
         {
             services.Configure<DataOptions>(Configuration.GetSection(DataOptions.Position));
-            services.Configure<NotificationOptions>(Configuration.GetSection(NotificationOptions.Position));
+            services.AddOptions<NotificationOptions>().Bind(Configuration.GetSection(NotificationOptions.Position))
+                .Validate(o => o.IsValid(), "Discord webhook must use HTTPS and role ID must be a positive integer.")
+                .ValidateOnStart();
             services.Configure<ServersConfiguration>(Configuration.GetSection("Servers"));
 
             services.AddSingleton<DataManager>();
@@ -67,8 +70,10 @@ namespace SS14.Watchdog
             services.AddHostedService(p => p.GetService<BackgroundTaskQueue>()!);
 
             services.AddSingleton<NotificationManager>();
+            services.AddHostedService(p => p.GetRequiredService<NotificationManager>());
 
-            services.AddHttpClient(NotificationManager.DiscordHttpClient);
+            services.AddHttpClient(NotificationManager.DiscordHttpClient).RemoveAllLoggers();
+            services.AddHttpClient(UpdateProviderManifest.HttpClientName).RemoveAllLoggers();
         }
 
         // This method gets called by the runtime. Use this method to configure the HTTP request pipeline.

@@ -3,13 +3,23 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to create release for'
+        description: 'Release tag, or container / container-test for a manual image build'
         required: true
         type: string
 jobs:
+  container:
+    if: inputs.tag == 'container' || inputs.tag == 'container-test'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/container.yml
+    with:
+      tag: dev
+      publish: ${{ inputs.tag == 'container' }}
   release:
+    if: inputs.tag != 'container' && inputs.tag != 'container-test'
     permissions: write-all
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -19,15 +29,15 @@ jobs:
       - name: Setup .NET Core
         uses: actions/setup-dotnet@v5.1.0
         with:
-          dotnet-version: 10.0.x
+          global-json-file: global.json
       - name: Install dependencies
-        run: dotnet restore
+        run: dotnet restore --locked-mode
       - name: Publish
         run: |
           dotnet build --configuration Release --no-restore
-          dotnet publish --configuration Release --no-restore -o dist
+          dotnet publish SS14.Watchdog/SS14.Watchdog.csproj --configuration Release --runtime linux-x64 --self-contained false --no-restore -o dist
       - name: Test
-        run: dotnet test --no-restore --verbosity normal
+        run: dotnet test --configuration Release --no-build --no-restore --verbosity normal
       - name: Zip release
         run: |
           cd dist

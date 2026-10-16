@@ -70,14 +70,13 @@ public sealed class ProcessManagerSystemd : IProcessManager, IHostedService
         args.Add(Path.GetFileName(data.Program));
         foreach (var argument in data.Arguments)
         {
-            _logger.LogTrace("Arg: {Argument}", argument);
             args.Add(argument);
         }
 
         var env = new List<string>();
         foreach (var (envVar, envValue) in data.EnvironmentVariables)
         {
-            _logger.LogTrace("Env: {EnvVar} = {EnvValue}", envVar, envValue);
+            _logger.LogTrace("Setting environment variable {EnvVar}.", envVar);
             env.Add($"{envVar}={envValue}");
         }
 
@@ -225,7 +224,7 @@ public sealed class ProcessManagerSystemd : IProcessManager, IHostedService
         }
         catch (DBusException e) when (e.ErrorName == "org.freedesktop.DBus.Error.UnknownObject" || e.ErrorName == "org.freedesktop.systemd1.NoSuchUnit")
         {
-            _logger.LogTrace(e, "Error while trying to find persisted server. This probably just indicates the server is gone.");
+            _logger.LogTrace(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Error while trying to find persisted server. This probably just indicates the server is gone.");
             return null;
         }
     }

@@ -9,6 +9,7 @@ using Dapper;
 using Microsoft.Extensions.Logging;
 using SS14.Watchdog.Components.ProcessManagement;
 using SS14.Watchdog.Components.Updates;
+using SS14.Watchdog.Utility;
 
 namespace SS14.Watchdog.Components.ServerManagement;
 
@@ -45,19 +46,49 @@ public sealed partial class ServerInstance
     // Server got an explicit stop command, will not be automatically restarted.
     private bool _stopped;
 
-    private string? _pendingRevertTarget;
-
     public async Task StartAsync(string baseServerAddress, CancellationToken cancel)
     {
         _baseServerAddress = baseServerAddress;
+        _instanceCancellation = cancel;
 
         _logger.LogDebug("Starting server {Key}", Key);
 
-        await TryLoadPersistedProcess(cancel);
-        await _commandQueue.Writer.WriteAsync(new CommandStart(), cancel);
+        using var periodicUpdateCts = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+        var periodicUpdateTask = _updateProvider != null
+            ? RunPeriodicUpdateChecksAsync(periodicUpdateCts.Token)
+            : Task.CompletedTask;
+        var policyTask = RunPolicyChecksAsync(periodicUpdateCts.Token);
 
         try
         {
+            var recoveredPersistedProcess = await TryLoadPersistedProcess(cancel);
+            if (!recoveredPersistedProcess)
+            {
+                try
+                {
+                    if (UpdateStaging.RecoverInterruptedUpdate(Path.Combine(InstanceDir, "bin")))
+                    {
+                        _logger.LogWarning("Recovered the previous server files for {Key} after an interrupted update.", Key);
+                    }
+                }
+                catch (Exception e)
+                {
+                    _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Could not recover previous server files for {Key}; starting the available files.", Key);
+                }
+            }
+
+            RestoreCountdown(recoveredPersistedProcess);
+
+            if (recoveredPersistedProcess)
+            {
+                _logger.LogInformation("Checking for updates after recovering persisted server {Key}.", Key);
+                await _commandQueue.Writer.WriteAsync(new CommandCheckForUpdate(), cancel);
+            }
+
+            CleanupInstance();
+
+            await _commandQueue.Writer.WriteAsync(new CommandStart(), cancel);
+
             await CommandLoop(cancel);
 
             // Currently no way for this to be reachable, as shutdown is always caused by cancellation.
@@ -69,20 +100,65 @@ public sealed partial class ServerInstance
         catch (Exception e)
         {
             // Oh fuck.
-            _logger.LogCritical(e, "Exception occurred in server instance loop!");
+            _logger.LogCritical(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Exception occurred in server instance loop!");
+            _notificationManager.SendError(Key, $"Server management loop stopped: {e.Message}");
         }
         finally
         {
             // Whether clean or unclear, run shutdown logic to the best of our abilities.
 
+            await periodicUpdateCts.CancelAsync();
+            CancelScheduledRestart();
+            StopCountdownTimer();
+            CancelTimeoutTimer();
             await ShutdownAsync();
+            await periodicUpdateTask;
+            await policyTask;
         }
     }
 
-    private async Task TryLoadPersistedProcess(CancellationToken cancel)
+    private async Task RunPeriodicUpdateChecksAsync(CancellationToken cancel)
+    {
+        try
+        {
+            if (_instanceConfig.AutoUpdateChecks && _instanceConfig.AutoUpdateCheckIntervalSeconds > 0)
+            {
+                _logger.LogInformation("Automatic update checks for {Key} are enabled every {IntervalSeconds} seconds.",
+                    Key, _instanceConfig.AutoUpdateCheckIntervalSeconds);
+            }
+            else
+            {
+                _logger.LogInformation("Automatic update checks for {Key} are disabled.", Key);
+            }
+
+            while (!cancel.IsCancellationRequested)
+            {
+                if (!_instanceConfig.AutoUpdateChecks || _instanceConfig.AutoUpdateCheckIntervalSeconds <= 0)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), cancel);
+                    continue;
+                }
+
+                await Task.Delay(TimeSpan.FromSeconds(_instanceConfig.AutoUpdateCheckIntervalSeconds), cancel);
+
+                _logger.LogTrace("Running periodic update check for {Key}", Key);
+                await _commandQueue.Writer.WriteAsync(new CommandCheckForUpdate(), cancel);
+            }
+        }
+        catch (OperationCanceledException) when (cancel.IsCancellationRequested)
+        {
+            // Expected during watchdog shutdown.
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Exception while running periodic update checks for {Key}", Key);
+        }
+    }
+
+    private async Task<bool> TryLoadPersistedProcess(CancellationToken cancel)
     {
         if (!_processManager.CanPersist)
-            return;
+            return false;
 
         string? token;
         {
@@ -95,7 +171,7 @@ public sealed partial class ServerInstance
         if (token == null)
         {
             _logger.LogDebug("No persisted server token, not trying to load persisted process.");
-            return;
+            return false;
         }
 
         _logger.LogInformation("Trying to load persisted server process...");
@@ -104,16 +180,18 @@ public sealed partial class ServerInstance
         if (handle == null)
         {
             _logger.LogInformation("Couldn't load persisted process");
-            return;
+            return false;
         }
 
         _logger.LogInformation("Loading persisted process: {Process}", handle);
         _runningServer = handle;
+        _processStartedAt = _timeProvider.GetUtcNow();
 
         SetToken(token);
 
         MonitorServer(++_startNumber, cancel);
         StartTimeoutTimer();
+        return true;
     }
 
     private async Task CommandLoop(CancellationToken cancel)
@@ -150,8 +228,20 @@ public sealed partial class ServerInstance
             case CommandTimedOut timedOut:
                 await RunCommandTimedOut(timedOut, cancel);
                 break;
-            case CommandUpdateAvailable updateAvailable:
-                await RunCommandUpdateAvailable(updateAvailable, cancel);
+            case CommandUpdatePrepared updatePrepared:
+                await RunCommandUpdatePrepared(updatePrepared, cancel);
+                break;
+            case CommandPolicyTick:
+                await RunPolicyTick(cancel);
+                break;
+            case CommandUpdateCountdown countdown:
+                await RunCountdownTick(countdown, cancel);
+                break;
+            case CommandRestartDue due:
+                await RunRestartDue(due, cancel);
+                break;
+            case CommandCheckForUpdate check:
+                await RunCommandCheckForUpdate(check, cancel);
                 break;
             case CommandRevert revert:
                 await RunCommandRevert(revert, cancel);
@@ -163,6 +253,8 @@ public sealed partial class ServerInstance
 
     private async Task RunCommandRestart(CancellationToken cancel)
     {
+        CancelScheduledRestart();
+        _crashPolicy.Reset();
         if (_stopped)
         {
             _logger.LogDebug("Clearing stopped flag due to manual server restart");
@@ -171,12 +263,17 @@ public sealed partial class ServerInstance
 
         if (_runningServer == null)
         {
-            _loadFailCount = 0;
-            _startupFailUpdateWait = false;
             await StartServer(cancel);
             return;
         }
 
+        _expectedServerExit = true;
+        if (_countdown is { Confirmed: true } countdown)
+        {
+            await RequestCountdownShutdown(countdown, cancel);
+            return;
+        }
+        await CancelCountdown(cancel);
         await ForceShutdownServerAsync(cancel);
     }
 
@@ -185,6 +282,8 @@ public sealed partial class ServerInstance
         // TODO: use stopCommand to indicate more extensive error message to error.
 
         _stopped = true;
+        CancelScheduledRestart();
+        await CancelCountdown(cancel);
         if (IsRunning)
         {
             _logger.LogTrace("Server is running, sending fake update notification to make it stop");
@@ -192,27 +291,152 @@ public sealed partial class ServerInstance
         }
     }
 
-    private async Task RunCommandUpdateAvailable(CommandUpdateAvailable command, CancellationToken cancel)
+    private async Task RunCommandUpdatePrepared(CommandUpdatePrepared command, CancellationToken cancel)
     {
-        _updateOnRestart = command.UpdateAvailable;
-        if (command.UpdateAvailable)
+        _updateCheckInProgress = false;
+        if (command.Generation != _updateGeneration || _manualVersionOverride || _pendingUpdateHealth != null)
         {
-            if (IsRunning)
+            if (command.Update != null)
+                UpdateStaging.Discard(command.Update);
+
+            // An explicit update may have superseded a check that was already downloading.
+            if (command.Generation != _updateGeneration)
+                await RunCommandCheckForUpdate(new CommandCheckForUpdate(), cancel);
+            return;
+        }
+
+        if (command.Update == null)
+        {
+            if (_preparedUpdate == null)
+                _updateNotificationSent = false;
+            return;
+        }
+
+        var update = command.Update;
+        if (_countdown != null && _preparedUpdate != null && update.Version != _preparedUpdate.Version)
+        {
+            UpdateStaging.Discard(update);
+            return;
+        }
+        if (update.Version == _currentRevision || _pendingUpdateHealth?.TargetRevision == update.Version)
+        {
+            UpdateStaging.Discard(update);
+            _logger.LogTrace("Discarding redundant prepared update {Version} for {Key}.", update.Version, Key);
+            return;
+        }
+
+        if (_blockedUpdateVersions.Contains(update.Version))
+        {
+            UpdateStaging.Discard(update);
+            _logger.LogWarning("Ignoring blocked update {Version} for {Key}; it failed earlier in this Watchdog session.",
+                update.Version, Key);
+            return;
+        }
+
+        if (_preparedUpdate != null)
+        {
+            if (_preparedUpdate.Version == update.Version)
             {
-                _logger.LogTrace("Server is running, sending update notification.");
-                await SendUpdateNotificationAsync(cancel);
+                UpdateStaging.Discard(update);
+                update = _preparedUpdate;
             }
-            else if (_stopped)
+            else
             {
-                _logger.LogInformation("Not restarting server for update as it was manually stopped.");
-            }
-            else if (_startupFailUpdateWait)
-            {
-                _startupFailUpdateWait = false;
-                _logger.LogInformation("Starting failed server after update.");
-                await StartServer(cancel);
+                UpdateStaging.Discard(_preparedUpdate);
+                _preparedUpdate = update;
             }
         }
+        else
+        {
+            _preparedUpdate = update;
+        }
+
+        _updateOnRestart = true;
+        _preparedUpdateIsManual = false;
+
+        if (IsRunning)
+        {
+            await TrySendPreparedUpdateNotificationAsync(cancel);
+        }
+        else if (_stopped)
+        {
+            _logger.LogInformation("Not restarting server for update as it was manually stopped.");
+        }
+        else if (_restartPending)
+        {
+            CancelScheduledRestart();
+            _crashPolicy.Reset();
+            _logger.LogInformation("Starting failed server after update.");
+            await StartServer(cancel);
+        }
+    }
+
+    private async Task RunCommandCheckForUpdate(CommandCheckForUpdate command, CancellationToken cancel)
+    {
+        if (command.Manual)
+        {
+            if (_manualVersionOverride)
+            {
+                if (_preparedUpdate != null)
+                    UpdateStaging.Discard(_preparedUpdate);
+                _preparedUpdate = null;
+                _preparedUpdateIsManual = false;
+                _updateNotificationSent = false;
+                _updateOnRestart = false;
+            }
+
+            _manualVersionOverride = false;
+            _updateGeneration++;
+            _updateCheckAfterHealth = _pendingUpdateHealth != null;
+        }
+
+        // A selected version stays selected until an explicit /update or a Watchdog restart.
+        // Do not replace files again while the previous update is still proving healthy.
+        if (_pendingUpdateHealth != null)
+            return;
+
+        if (_manualVersionOverride && _preparedUpdate == null)
+            return;
+
+        if (_preparedUpdate != null)
+        {
+            if (IsRunning)
+                await TrySendPreparedUpdateNotificationAsync(cancel);
+
+            return;
+        }
+
+        BeginUpdateCheck();
+    }
+
+    private async Task TrySendPreparedUpdateNotificationAsync(CancellationToken cancel)
+    {
+        if (_preparedUpdate == null || _updateNotificationSent)
+            return;
+
+        if (!_preparedUpdateIsManual && _instanceConfig.UpdateRestart.Mode == Configuration.UpdateRestartMode.Countdown)
+        {
+            await TryStartCountdown(cancel);
+            return;
+        }
+
+        if (!await UpdateAllowedAsync(cancel))
+            return;
+        try
+        {
+            InstanceStorage.EnsureAvailable(InstanceDir, 0, UpdatePreparationOptions.MinimumFreeSpaceBytes);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            _notificationManager.SendError(Key, $"Update {_preparedUpdate.Version} is deferred: {e.Message}");
+            return;
+        }
+
+        _logger.LogInformation("Server {Key} has prepared update {Version}; sending update notification.",
+            Key, _preparedUpdate.Version);
+        _updateNotificationSent = await SendUpdateNotificationAsync(cancel);
+        if (_updateNotificationSent)
+            _updateOnRestart = true;
     }
 
     /// <summary>
@@ -226,17 +450,37 @@ public sealed partial class ServerInstance
     /// <returns>A task that represents the asynchronous operation.</returns>
     private async Task RunCommandRevert(CommandRevert command, CancellationToken cancel)
     {
-        if (command.TargetVersion == _currentRevision)
-            return;
+        await CancelCountdown(cancel);
+        _manualVersionOverride = true;
+        _updateCheckAfterHealth = false;
+        _updateGeneration++;
+        _updateNotificationSent = false;
+        if (_preparedUpdate != null)
+            UpdateStaging.Discard(_preparedUpdate);
+        _preparedUpdate = null;
 
-        _pendingRevertTarget = command.TargetVersion;
+        if (command.Update.Version == _currentRevision)
+        {
+            UpdateStaging.Discard(command.Update);
+            _updateOnRestart = false;
+            return;
+        }
+
+        CancelScheduledRestart();
+        _crashPolicy.Reset();
+        _preparedUpdate = command.Update;
+        _preparedUpdateIsManual = true;
+        _updateOnRestart = true;
 
         if (IsRunning)
         {
             if (command.Immediate)
+            {
+                _expectedServerExit = true;
                 await ForceShutdownServerAsync(cancel);
+            }
             else
-                await SendUpdateNotificationAsync(cancel);
+                await TrySendPreparedUpdateNotificationAsync(cancel);
         }
         else if (!_stopped)
         {
@@ -262,8 +506,12 @@ public sealed partial class ServerInstance
 
     private Task RunCommandServerPing(CommandServerPing ping, CancellationToken cancel)
     {
+        if (ping.StartNumber != _startNumber || !IsRunning)
+            return Task.CompletedTask;
         _logger.LogTrace("Received ping from server.");
         _lastPing = DateTime.Now;
+
+        CommitHealthyUpdate();
 
         StartTimeoutTimer();
 
@@ -286,41 +534,33 @@ public sealed partial class ServerInstance
             return;
         }
 
-        if (!exit.ExitStatus.IsClean)
-            _notificationManager.SendNotification($"Server `{Key}` exited with non-clean exit status: {exit.ExitStatus}. Check server logs for possible causes.");
-
+        CancelTimeoutTimer();
+        ClearCountdown();
         _runningServer = null;
-        if (_lastPing == null)
+        if (_pendingUpdateHealth is { } update && update.StartNumber == exit.StartNumber)
         {
-            // If the server shuts down before sending a ping, ever, we assume it crashed during init.
-            _loadFailCount += 1;
-            _logger.LogWarning("{Key} shut down before sending ping on attempt {attempt}", Key,
-                _loadFailCount);
-
-            if (_loadFailCount >= LoadFailMax)
-            {
-                _startupFailUpdateWait = true;
-                // Server keeps crashing during init, wait for an update to fix it.
-                _logger.LogWarning("{Key} is failing to start, giving up until update or manual intervention.", Key);
-                _notificationManager.SendNotification($"Server `{Key}` is failing to start, needs manual intervention or update.");
-                return;
-            }
-        }
-        else
-        {
-            _loadFailCount = 0;
+            await RollbackFailedUpdateAsync(_exitFailureReason ?? "server exited before its first watchdog ping", cancel);
+            return;
         }
 
-        if (!_stopped)
-        {
-            _logger.LogInformation("{Key}: Restarting server after exit...", Key);
-            await StartServer(cancel);
-        }
-        else
+        if (_stopped)
         {
             _logger.LogInformation("{Key}: Not restarting server as it was manually stopped.", Key);
-            _notificationManager.SendNotification($"Server `{Key}` has exited after manual stop request.");
+            return;
         }
+
+        if (_expectedServerExit || (_updateNotificationSent && exit.ExitStatus.IsClean))
+        {
+            await StartServer(cancel);
+            return;
+        }
+
+        var decision = _crashPolicy.RecordFailure(_timeProvider.GetUtcNow(),
+            _timeProvider.GetUtcNow() - _processStartedAt, _instanceConfig.CrashLoop);
+        var reason = _exitFailureReason ?? $"Unexpected process exit: {exit.ExitStatus}.";
+        _notificationManager.SendError(Key, $"{reason} Restart in {decision.Delay.TotalSeconds:0} seconds" +
+            (decision.CoolingDown ? " (crash-loop cooldown)." : "."));
+        ScheduleRestart(decision, cancel);
     }
 
     private async Task RunCommandStart(CancellationToken cancel)
@@ -338,15 +578,7 @@ public sealed partial class ServerInstance
             return;
         }
 
-        if (_pendingRevertTarget != null)
-        {
-            var target = _pendingRevertTarget;
-            _pendingRevertTarget = null;
-            _updateOnRestart = false;
-
-            await StartRunRevert(target, cancel);
-        }
-        else if (_updateOnRestart)
+        if (_updateOnRestart)
         {
             _updateOnRestart = false;
 
@@ -367,7 +599,13 @@ public sealed partial class ServerInstance
         }
 
         _lastPing = null;
+        _expectedServerExit = false;
+        _exitFailureReason = null;
+        _processStartedAt = _timeProvider.GetUtcNow();
         _startNumber++;
+
+        if (_pendingUpdateHealth != null)
+            _pendingUpdateHealth = _pendingUpdateHealth with { StartNumber = _startNumber };
 
         _logger.LogTrace("Getting launch info...");
 
@@ -424,10 +662,22 @@ public sealed partial class ServerInstance
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Exception while launching!");
+            _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Exception while launching!");
+
+            if (_pendingUpdateHealth != null)
+            {
+                await RollbackFailedUpdateAsync($"the updated server process could not be started: {e.Message}", cancel);
+                return;
+            }
+            _exitFailureReason = $"Could not start server: {SensitiveData.Redact(e.Message)}";
+            await RunCommandServerExit(new CommandServerExit(_startNumber,
+                new ProcessExitStatus(ProcessExitReason.ExitCode, 1)), cancel);
+            return;
         }
 
         MonitorServer(_startNumber, cancel);
+        if (_pendingUpdateHealth != null && _instanceConfig.AutoUpdateHealthTimeoutSeconds is <= 0)
+            CommitHealthyUpdate();
         StartTimeoutTimer();
     }
 
@@ -460,7 +710,7 @@ public sealed partial class ServerInstance
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Error while waiting on process exit for {Key}", Key);
+            _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Error while waiting on process exit for {Key}", Key);
         }
     }
 
@@ -469,94 +719,78 @@ public sealed partial class ServerInstance
         if (_updateProvider == null)
             return;
 
-        bool hasUpdate;
+        // An in-flight background preparation will notify this process when its files are ready.
+        if (_preparedUpdate == null && _updateCheckInProgress)
+            return;
+
+        var update = _preparedUpdate;
+        _preparedUpdate = null;
+
+        if (update == null && _manualVersionOverride)
+            return;
+
         try
         {
-            _logger.LogTrace("Checking for update...");
-            hasUpdate = await _updateProvider.CheckForUpdateAsync(_currentRevision, cancel);
-            _logger.LogDebug("Update available: {available}.", hasUpdate);
+            update ??= await _updateProvider.PrepareUpdateAsync(_currentRevision, UpdatePreparationOptions, cancel);
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Error while checking for update!");
+            _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Error while preparing update for {Key}.", Key);
+            if (!cancel.IsCancellationRequested)
+                _notificationManager.SendError(Key, $"Update preparation failed: {e.Message}");
             return;
         }
 
-        if (!hasUpdate)
+        if (update == null)
             return;
 
-        _logger.LogTrace("Starting update...");
-        string? newRevision;
+        if (!_manualVersionOverride && _blockedUpdateVersions.Contains(update.Version))
+        {
+            UpdateStaging.Discard(update);
+            _logger.LogWarning("Skipping blocked update {Version} for {Key}.", update.Version, Key);
+            return;
+        }
+
+        if (update.Version == _currentRevision)
+        {
+            UpdateStaging.Discard(update);
+            return;
+        }
+
+        if (!_preparedUpdateIsManual && !_updateNotificationSent && File.Exists(GetProgramPath()) &&
+            !await UpdateAllowedAsync(cancel))
+        {
+            _preparedUpdate = update;
+            _updateOnRestart = true;
+            return;
+        }
+
         try
         {
-            newRevision = await _updateProvider.RunUpdateAsync(
-                _currentRevision,
-                Path.Combine(InstanceDir, "bin"),
-                cancel);
+            AppliedUpdate? appliedUpdate = null;
+            InstanceStorage.EnsureAvailable(InstanceDir, 0, UpdatePreparationOptions.MinimumFreeSpaceBytes);
+            if (update.StagingDirectory != null)
+                appliedUpdate = UpdateStaging.Apply(update, Path.Combine(InstanceDir, "bin"));
+
+            _pendingUpdateHealth = new PendingUpdateHealth(update.Version, _currentRevision, appliedUpdate);
+            _currentRevision = update.Version;
+            _logger.LogInformation("Applied prepared update {Version} for {Key}; waiting for the first watchdog ping.",
+                update.Version, Key);
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "Uncaught error while updating server");
+            UpdateStaging.Discard(update);
+            _blockedUpdateVersions.Add(update.Version);
+            _updateNotificationSent = false;
+            _preparedUpdateIsManual = false;
+            _logger.LogError(SS14.Watchdog.Utility.SensitiveData.SafeException(e), "Failed to apply prepared update {Version} for {Key}; the existing server files will be started.",
+                update.Version, Key);
+            _notificationManager.SendError(Key,
+                $"Could not apply update `{update.Version}`: {e.Message}. Starting the existing server version.");
             return;
-        }
-
-        if (newRevision != null)
-        {
-            _logger.LogDebug("Updated from {current} to {new}.",
-                _currentRevision ?? "<none>",
-                newRevision);
-
-            _loadFailCount = 0;
-            _currentRevision = newRevision;
-            SaveData();
-        }
-        else
-        {
-            _logger.LogError("Failed to update!");
         }
     }
 
-    /// <summary>
-    /// Initiates the server revert process to change the server's version to the specified target version.
-    /// The operation downloads and applies the appropriate version, updating the server state accordingly.
-    /// </summary>
-    /// <param name="targetVersion">The target server version to revert to.</param>
-    /// <param name="cancel">
-    /// A <see cref="CancellationToken"/> used to signal the operation should be canceled.
-    /// </param>
-    /// <returns>A task that represents the asynchronous revert operation.</returns>
-    private async Task StartRunRevert(string targetVersion, CancellationToken cancel)
-    {
-        if (_updateProvider is not UpdateProviderManifest manifestProvider)
-            return;
-
-        string? newRevision;
-        try
-        {
-            newRevision = await manifestProvider.RunUpdateToVersionAsync(
-                targetVersion,
-                Path.Combine(InstanceDir, "bin"),
-                cancel);
-        }
-        catch (Exception e)
-        {
-            _logger.LogError(e, "Uncaught error while reverting server");
-            return;
-        }
-
-        if (newRevision != null)
-        {
-            _logger.LogDebug("Reverted from {Current} to {New}.", _currentRevision ?? "<none>", newRevision);
-
-            _loadFailCount = 0;
-            _currentRevision = newRevision;
-            SaveData();
-        }
-        else
-        {
-            _logger.LogError("{Key}: Failed to revert to {Version}!", Key, targetVersion);
-        }
-    }
 
     /// <summary>
     /// Base class for all commands that are executed by the server instance actor.
@@ -564,9 +798,14 @@ public sealed partial class ServerInstance
     private abstract record Command;
 
     /// <summary>
-    /// Mark the server as having an update available, which will be checked & downloaded the next time it restarts.
+    /// A server update has been downloaded and validated, and is ready to be applied on restart.
     /// </summary>
-    private sealed record CommandUpdateAvailable(bool UpdateAvailable) : Command;
+    private sealed record CommandUpdatePrepared(PreparedUpdate? Update, int Generation) : Command;
+
+    /// <summary>
+    /// Start a provider update check, or retry notification for an update that is already prepared.
+    /// </summary>
+    private sealed record CommandCheckForUpdate(bool Manual = false) : Command;
 
     /// <summary>
     /// Command to start the server, if it's not already running.
@@ -586,7 +825,7 @@ public sealed partial class ServerInstance
     /// <summary>
     /// Command to revert the server to a specific (already-resolved) version.
     /// </summary>
-    private sealed record CommandRevert(string TargetVersion, bool Immediate) : Command;
+    private sealed record CommandRevert(PreparedUpdate Update, bool Immediate) : Command;
 
     /// <summary>
     /// The server has failed to ping back in time, grab the axe!
@@ -601,5 +840,5 @@ public sealed partial class ServerInstance
     /// <summary>
     /// The server has sent us a ping, it's still kicking!
     /// </summary>
-    private sealed record CommandServerPing : Command;
+    private sealed record CommandServerPing(int StartNumber) : Command;
 }

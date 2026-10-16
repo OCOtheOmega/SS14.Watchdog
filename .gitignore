@@ -1,4 +1,7 @@
 appsettings.Secret.yml
+.env
+.env.*
+!.env.example
 SS14.Watchdog/data.db
 SS14.Watchdog/data.db-journal
 

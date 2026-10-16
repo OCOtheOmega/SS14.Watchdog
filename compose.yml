@@ -1,0 +1,21 @@
+services:
+  watchdog:
+    image: ${WATCHDOG_IMAGE:-ss14-watchdog:local}
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      Servers__Instances__main__ApiToken: ${WATCHDOG_API_TOKEN:?Set WATCHDOG_API_TOKEN in .env}
+      Notification__DiscordWebhook: ${DISCORD_WEBHOOK_URL:-}
+      Notification__DiscordRoleId: ${DISCORD_ROLE_ID:-}
+    ports:
+      - "127.0.0.1:5000:5000/tcp"
+      - "1212:1212/tcp"
+      - "1212:1212/udp"
+    volumes:
+      - watchdog-data:/data
+      - ${WATCHDOG_CONFIG:-./deploy/appsettings.example.yml}:/data/appsettings.yml:ro
+      - ${SS14_CONFIG:-./deploy/server.example.toml}:/data/instances/main/config.toml:ro
+
+volumes:
+  watchdog-data:

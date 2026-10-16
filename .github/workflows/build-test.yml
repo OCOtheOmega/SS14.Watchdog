@@ -1,22 +1,57 @@
 name: Build & Test
 on:
   push:
-    branches: [ master ]
+    branches: [ master, dev ]
   pull_request:
-    branches: [ master ]
+    branches: [ master, dev ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6.0.1
       - name: Setup .NET Core
         uses: actions/setup-dotnet@v5.1.0
         with:
-          dotnet-version: 10.0.x
+          global-json-file: global.json
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
       - name: Install dependencies
-        run: dotnet restore
+        run: dotnet restore --locked-mode
       - name: Build
         run: dotnet build --configuration Release --no-restore
       - name: Test
-        run: dotnet test --no-restore --verbosity normal
+        run: dotnet test --configuration Release --no-build --no-restore --verbosity normal
+
+  nix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: cachix/install-nix-action@v31
+      - name: Build the pinned Nix package
+        run: nix build --no-write-lock-file --print-build-logs
+      - name: Verify packaged runtime
+        run: |
+          mkdir -p "$RUNNER_TEMP/watchdog-nix-smoke"
+          printf 'Servers:\n  Instances: {}\n' > "$RUNNER_TEMP/watchdog-nix-smoke/appsettings.yml"
+          cd "$RUNNER_TEMP/watchdog-nix-smoke"
+          "$GITHUB_WORKSPACE/result/bin/SS14.Watchdog" --urls http://127.0.0.1:5500 > watchdog.log 2>&1 &
+          watchdog_pid=$!
+          trap 'kill "$watchdog_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:5500/watchdog/padlock; then exit 0; fi
+            sleep 1
+          done
+          cat watchdog.log
+          exit 1

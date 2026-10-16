@@ -46,21 +46,20 @@ namespace SS14.Watchdog.Components.Updates
             }
             catch (HttpRequestException e)
             {
-                _logger.LogWarning("Failed to check for updates due to exception:\n{0}", e);
-                // Update server probably down? No updates then.
+                _logger.LogWarning(SensitiveData.SafeException(e), "Failed to check Jenkins for updates.");
+                throw;
             }
 
-            return false;
         }
 
-        public override async Task<string?> RunUpdateAsync(
+        public override async Task<PreparedUpdate?> PrepareUpdateAsync(
             string? currentVersion,
-            string binPath,
+            UpdatePreparationOptions options,
             CancellationToken cancel = default)
         {
             try
             {
-                _logger.LogTrace("Updating...");
+                _logger.LogTrace("Preparing update...");
 
                 var buildRef = await GetLastSuccessfulBuildAsync(cancel);
 
@@ -83,39 +82,39 @@ namespace SS14.Watchdog.Components.Updates
                 var downloadRootUri = new Uri($"{_baseUrl}/job/{_jobName}/{buildRef.Number}/artifact/release/");
 
                 // Create temporary file to download binary into (not doing this in memory).
-                await using var tempFile = TempFile.CreateTempFile();
+                await using var tempFile = TempFile.CreateTempFile(options.InstanceDirectory);
                 // Download URI for server binary.
                 var serverDownload = new Uri(downloadRootUri, ServerZipName);
 
-                _logger.LogTrace("Downloading server binary from {download} to {tempFile}", serverDownload,
-                    tempFile.Name);
+                _logger.LogTrace("Downloading server binary to {TempFile}.", tempFile.Name);
 
                 // Download to file...
-                using var resp = await _httpClient.GetAsync(serverDownload, cancel);
+                using var resp = await _httpClient.GetAsync(serverDownload, HttpCompletionOption.ResponseHeadersRead, cancel);
                 resp.EnsureSuccessStatusCode();
-                await resp.Content.CopyToAsync(tempFile, cancel);
+                await UpdateStaging.CopyHttpContentWithLimitAsync(
+                    resp.Content,
+                    tempFile,
+                    options.MaximumDownloadBytes,
+                    cancel,
+                    options.MinimumFreeSpaceBytes);
 
-                _logger.LogTrace("Deleting old bin directory ({binPath})", binPath);
-                if (Directory.Exists(binPath))
-                {
-                    Directory.Delete(binPath, true);
-                }
-
-                Directory.CreateDirectory(binPath);
-
-                _logger.LogTrace("Extracting zip file");
-                // Reset file position so we can extract.
                 tempFile.Seek(0, SeekOrigin.Begin);
-
-                DoBuildExtract(tempFile, binPath);
-
-                return buildRef.Number.ToString(CultureInfo.InvariantCulture);
+                var version = buildRef.Number.ToString(CultureInfo.InvariantCulture);
+                var prepared = await UpdateStaging.StageArchiveAsync(
+                    tempFile,
+                    version,
+                    options.InstanceDirectory,
+                    options.MaximumExtractedBytes,
+                    cancel,
+                    options.MinimumFreeSpaceBytes);
+                _logger.LogInformation("Prepared validated Jenkins update {Version} in {StagingDirectory}.", version,
+                    prepared.StagingDirectory);
+                return prepared;
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Failed to run update!");
-
-                return null;
+                _logger.LogError(SensitiveData.SafeException(e), "Failed to prepare Jenkins update.");
+                throw;
             }
         }
 
